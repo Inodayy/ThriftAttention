@@ -797,6 +797,7 @@ void thrift_attention_fp16_finalize_kernel(
         }
 }
 
+// HEAD_DIM == 256: Tile in FP16_CHUNK-row sub-chunks
 template<typename T, bool CAUSAL, int BLOCK_Q, int BLOCK_KV_FP4, int HEAD_DIM,
          int NUM_WARPS, int WARP_Q, int TOPK_BUCKET>
 __launch_bounds__(NUM_WARPS * TA_WARP_SIZE)

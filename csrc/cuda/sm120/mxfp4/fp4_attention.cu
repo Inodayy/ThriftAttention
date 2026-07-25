@@ -281,6 +281,7 @@ void fp4_pv(
                     O_rmem[mma_id_q][mma_id_d]);
 }
 
+// HEAD_DIM==256: single-buffered KV loop
 template<typename T, bool CAUSAL, int BLOCK_Q, int BLOCK_KV, int HEAD_DIM,
          int HEAD_DIM_2, int SCALE_DIM,
          int NUM_WARPS, int WARP_Q>

@@ -480,6 +480,7 @@ void fp4_attention_kernel(
         }
 }
 
+// HEAD_DIM==256: double-buffered KV loop
 template<typename T, bool CAUSAL, int BLOCK_Q, int BLOCK_KV, int HEAD_DIM,
          int HEAD_DIM_2, int SCALE_DIM,
          int NUM_WARPS, int WARP_Q>
