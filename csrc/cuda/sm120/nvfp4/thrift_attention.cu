@@ -221,7 +221,7 @@ void thrift_attention_kernel(
             uint32_t K_rmem[BLOCK_KV_FP4 / MMA_N][HEAD_DIM / MMA_K_FP4][2];
             uint32_t sfK_rmem[BLOCK_KV_FP4 / MMA_N][HEAD_DIM / MMA_K_FP4];
 
-            if constexpr (HEAD_DIM / MMA_K_FP4 >= 2) {
+            if constexpr (HEAD_DIM / MMA_K_FP4 == 2) {
                 for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV_FP4 / MMA_N; mma_id_kv++) {
                     uint32_t addr = K_ld_base_fp4 + mma_id_kv * MMA_N * HEAD_DIM_2;
                     ta_ldmatrix_x4(K_rmem[mma_id_kv][0], addr);
@@ -801,6 +801,204 @@ void thrift_attention_fp16_finalize_kernel(
         }
 }
 
+template<typename T, bool CAUSAL, int BLOCK_Q, int BLOCK_KV_FP4, int HEAD_DIM,
+         int NUM_WARPS, int WARP_Q, int TOPK_BUCKET>
+__launch_bounds__(NUM_WARPS * TA_WARP_SIZE)
+__global__
+void thrift_attention_fp16_finalize_hd256_kernel(
+    const T* Q_fp16_in,
+    const T* K_fp16_in,
+    const T* V_fp16_in,
+    const int32_t* selected_blocks,
+    int topk_count,
+    T* O,
+    const float* rowmax_state,
+    const float* rowsum_state,
+    int bs,
+    int q_len,
+    int kv_len,
+    int num_q_heads,
+    int num_kv_heads)
+{
+    using Traits = PrecisionTraits<T>;
+    constexpr int TB_SIZE = NUM_WARPS * TA_WARP_SIZE;
+    constexpr int MMA_M = 16;
+    constexpr int MMA_K_FP16 = 16;
+    constexpr int MMA_N = 8;
+    constexpr float FP4_RANGE = 448.0f * 6.0f;
+    constexpr float FP4_RANGE_INV = 1.0f / FP4_RANGE;
+
+    const float softmax_scale = rsqrtf(static_cast<float>(HEAD_DIM));
+
+    const int bid = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int warp_id = tid / TA_WARP_SIZE;
+    const int lane_id = tid % TA_WARP_SIZE;
+
+    const int num_q_blocks = ta_cdiv(q_len, BLOCK_Q);
+    const int q_bid = bid / num_q_blocks;
+    const int q_block_id = bid % num_q_blocks;
+    const int batch_id = q_bid / num_q_heads;
+    const int q_head = q_bid - batch_id * num_q_heads;
+    const int kv_head = q_head / (num_q_heads / num_kv_heads);
+    const int kv_bid = batch_id * num_kv_heads + kv_head;
+
+    Q_fp16_in += (q_bid * q_len + q_block_id * BLOCK_Q) * HEAD_DIM;
+    K_fp16_in += kv_bid * kv_len * HEAD_DIM;
+    V_fp16_in += kv_bid * kv_len * HEAD_DIM;
+    O += (q_bid * q_len + q_block_id * BLOCK_Q) * HEAD_DIM;
+    rowmax_state += q_bid * q_len + q_block_id * BLOCK_Q;
+    rowsum_state += q_bid * q_len + q_block_id * BLOCK_Q;
+
+    const int q_block_start = q_block_id * BLOCK_Q;
+    const int max_kv_pos = q_block_start + BLOCK_Q - 1;
+    const int total_kv_iters = ta_cdiv(kv_len, BLOCK_KV_FP4);
+    const int num_kv_iters = CAUSAL
+        ? min(max_kv_pos / BLOCK_KV_FP4 + 1, total_kv_iters)
+        : total_kv_iters;
+
+    const int32_t* selected_row =
+        selected_blocks + (static_cast<int64_t>(q_bid) * num_q_blocks + q_block_id) * topk_count;
+
+    float rowmax[WARP_Q / MMA_M][2];
+    float rowsum[WARP_Q / MMA_M][2];
+    float O_rmem[WARP_Q / MMA_M][HEAD_DIM / MMA_N][4];
+
+    for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
+        const int row = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
+        rowmax[mma_id_q][0] = rowmax_state[row];
+        rowmax[mma_id_q][1] = rowmax_state[row + 8];
+        rowsum[mma_id_q][0] = rowsum_state[row];
+        rowsum[mma_id_q][1] = rowsum_state[row + 8];
+
+        const float partial_scale0 = rowsum[mma_id_q][0] * FP4_RANGE;
+        const float partial_scale1 = rowsum[mma_id_q][1] * FP4_RANGE;
+        for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++) {
+            const int col = mma_id_d * MMA_N + (lane_id % 4) * 2;
+            const T* upper = O + row * HEAD_DIM + col;
+            const T* lower = O + (row + 8) * HEAD_DIM + col;
+            O_rmem[mma_id_q][mma_id_d][0] = Traits::to_float(upper[0]) * partial_scale0;
+            O_rmem[mma_id_q][mma_id_d][1] = Traits::to_float(upper[1]) * partial_scale0;
+            O_rmem[mma_id_q][mma_id_d][2] = Traits::to_float(lower[0]) * partial_scale1;
+            O_rmem[mma_id_q][mma_id_d][3] = Traits::to_float(lower[1]) * partial_scale1;
+        }
+    }
+
+    extern __shared__ uint8_t smem[];
+    const uint32_t smem_base = __cvta_generic_to_shared(smem);
+    const uint32_t Q_fp16_smem = smem_base;
+
+    constexpr int Q_FP16_ROW_BYTES = HEAD_DIM * (int)sizeof(T);
+    constexpr int Q_FP16_TOTAL_BYTES = BLOCK_Q * Q_FP16_ROW_BYTES;
+    constexpr int Q_FP16_TOTAL_CHUNKS = Q_FP16_TOTAL_BYTES / 16;
+
+    for (int chunk = tid; chunk < Q_FP16_TOTAL_CHUNKS; chunk += TB_SIZE) {
+        const int byte_off = chunk * 16;
+        const int row = byte_off / Q_FP16_ROW_BYTES;
+        const int col = byte_off % Q_FP16_ROW_BYTES;
+        uint32_t dst = ta_swizzle<Q_FP16_ROW_BYTES>(Q_fp16_smem + row * Q_FP16_ROW_BYTES + col);
+        const char* src = reinterpret_cast<const char*>(Q_fp16_in + row * HEAD_DIM) + col;
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(dst), "l"(src));
+    }
+    asm volatile("cp.async.commit_group;");
+    asm volatile("cp.async.wait_all;");
+    __syncthreads();
+
+    uint32_t Q_fp16_rmem[HEAD_DIM / MMA_K_FP16][4];
+    {
+        const int q_row = warp_id * WARP_Q + (lane_id % 16);
+        const int q_col_bytes = (lane_id / 16) * 8 * (int)sizeof(T);
+        uint32_t Q_fp16_ld_base = ta_swizzle<Q_FP16_ROW_BYTES>(
+            Q_fp16_smem + q_row * Q_FP16_ROW_BYTES + q_col_bytes);
+
+        for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_K_FP16; mma_id_d++) {
+            uint32_t addr = Q_fp16_ld_base;
+            addr ^= mma_id_d * MMA_K_FP16 * (int)sizeof(T);
+            ta_ldmatrix_x4(Q_fp16_rmem[mma_id_d], addr);
+        }
+    }
+    __syncthreads();
+
+    const int q_row_upper = warp_id * WARP_Q + (lane_id / 4);
+    const int q_row_lower = q_row_upper + 8;
+    const int q_row_upper_global = q_block_start + q_row_upper;
+    const int q_row_lower_global = q_block_start + q_row_lower;
+    const int k_col_base = (lane_id % 4) * 2;
+
+    const int selected_limit = min(min(topk_count, TOPK_BUCKET), num_kv_iters);
+    for (int selected_idx = 0; selected_idx < selected_limit; selected_idx++) {
+        const int kv_iter = selected_row[selected_idx];
+        if (kv_iter < 0 || kv_iter >= num_kv_iters) {
+            continue;
+        }
+
+        constexpr int FP16_ROWS = BLOCK_KV_FP4;
+
+        // Tile in FP16_CHUNK-row sub-chunks, each folded into the running
+        // softmax to avoid overflowing the register file for HEAD_DIM 256
+        constexpr int FP16_CHUNK = 32;
+        constexpr int FP16_NUM_CHUNKS = FP16_ROWS / FP16_CHUNK;
+        constexpr int FP16_N_TILES = FP16_CHUNK / MMA_N;
+        constexpr int FP16_PV_CHUNKS = FP16_CHUNK / MMA_K_FP16;
+        constexpr int CHUNK_BYTES = FP16_CHUNK * HEAD_DIM * (int)sizeof(T);
+
+        const int k_block_start = kv_iter * BLOCK_KV_FP4;
+        const bool needs_causal_mask = CAUSAL && ((k_block_start + BLOCK_KV_FP4 - 1) > q_block_start);
+
+        const uint32_t K_chunk_smem = smem_base;
+        const uint32_t V_chunk_smem = smem_base + CHUNK_BYTES;
+
+        for (int chunk = 0; chunk < FP16_NUM_CHUNKS; chunk++) {
+            const int chunk_row0 = kv_iter * FP16_ROWS + chunk * FP16_CHUNK;
+            const int chunk_col0 = k_block_start + chunk * FP16_CHUNK;
+
+            ta_gmem_to_smem<FP16_CHUNK, HEAD_DIM, TB_SIZE, T>(
+                K_chunk_smem, K_fp16_in + chunk_row0 * HEAD_DIM, tid, HEAD_DIM);
+            ta_gmem_to_smem<FP16_CHUNK, HEAD_DIM, TB_SIZE, T>(
+                V_chunk_smem, V_fp16_in + chunk_row0 * HEAD_DIM, tid, HEAD_DIM);
+            asm volatile("cp.async.commit_group;");
+            asm volatile("cp.async.wait_all;");
+            __syncthreads();
+
+            float S_fp16[FP16_N_TILES][4] = {};
+            uint32_t P_rmem[FP16_PV_CHUNKS][4];
+
+            fp16_finalize_qk<T, HEAD_DIM, FP16_N_TILES>(
+                S_fp16, Q_fp16_rmem, K_chunk_smem, lane_id);
+            fp16_finalize_softmax_pack<T, HEAD_DIM, FP16_N_TILES, CAUSAL>(
+                S_fp16, P_rmem, rowmax[0], rowsum[0], O_rmem[0],
+                chunk_col0, q_row_upper_global, q_row_lower_global, k_col_base,
+                softmax_scale, needs_causal_mask, lane_id);
+            fp16_finalize_pv<T, HEAD_DIM, FP16_PV_CHUNKS>(
+                O_rmem[0], P_rmem, V_chunk_smem, lane_id);
+
+            __syncthreads();
+        }
+    }
+
+    for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
+        for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++) {
+            const int row = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
+            const int col = mma_id_d * MMA_N + (lane_id % 4) * 2;
+            float *regs = O_rmem[mma_id_q][mma_id_d];
+
+            const float norm0 = rowsum[mma_id_q][0] > 0.0f
+                ? FP4_RANGE_INV / rowsum[mma_id_q][0]
+                : 0.0f;
+            const float norm1 = rowsum[mma_id_q][1] > 0.0f
+                ? FP4_RANGE_INV / rowsum[mma_id_q][1]
+                : 0.0f;
+
+            regs[0] *= norm0;  regs[1] *= norm0;
+            regs[2] *= norm1;  regs[3] *= norm1;
+
+            reinterpret_cast<typename Traits::vec2*>(O + (row + 0) * HEAD_DIM + col)[0] =
+                Traits::pack2(regs[0], regs[1]);
+            reinterpret_cast<typename Traits::vec2*>(O + (row + 8) * HEAD_DIM + col)[0] =
+                Traits::pack2(regs[2], regs[3]);
+        }
+}
+
 template<typename T, bool CAUSAL, int HEAD_DIM, int BLOCK_Q, int BLOCK_KV_FP4, int TOPK_BUCKET>
 static void launch_thrift_attention_fp16_finalize(
     const T* Q_fp16,
@@ -826,16 +1024,29 @@ static void launch_thrift_attention_fp16_finalize(
 
     const int num_blocks = bs * ta_cdiv(q_len, BLOCK_Q);
 
-    auto fp16_finalize_kernel = thrift_attention_fp16_finalize_kernel<
-        T, CAUSAL, BLOCK_Q, BLOCK_KV_FP4, HEAD_DIM, NUM_WARPS, WARP_Q, TOPK_BUCKET>;
+    if constexpr (HEAD_DIM == 256) {
+        auto fp16_finalize_kernel = thrift_attention_fp16_finalize_hd256_kernel<
+            T, CAUSAL, BLOCK_Q, BLOCK_KV_FP4, HEAD_DIM, NUM_WARPS, WARP_Q, TOPK_BUCKET>;
 
-    cudaFuncSetAttribute(fp16_finalize_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, fp16_smem);
+        cudaFuncSetAttribute(fp16_finalize_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, fp16_smem);
 
-    fp16_finalize_kernel<<<num_blocks, TB_SIZE, fp16_smem>>>(
-        Q_fp16, K_fp16, V_fp16,
-        selected_blocks, topk_count,
-        O, rowmax_state, rowsum_state,
-        bs, q_len, kv_len, num_q_heads, num_kv_heads);
+        fp16_finalize_kernel<<<num_blocks, TB_SIZE, fp16_smem>>>(
+            Q_fp16, K_fp16, V_fp16,
+            selected_blocks, topk_count,
+            O, rowmax_state, rowsum_state,
+            bs, q_len, kv_len, num_q_heads, num_kv_heads);
+    } else {
+        auto fp16_finalize_kernel = thrift_attention_fp16_finalize_kernel<
+            T, CAUSAL, BLOCK_Q, BLOCK_KV_FP4, HEAD_DIM, NUM_WARPS, WARP_Q, TOPK_BUCKET>;
+
+        cudaFuncSetAttribute(fp16_finalize_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, fp16_smem);
+
+        fp16_finalize_kernel<<<num_blocks, TB_SIZE, fp16_smem>>>(
+            Q_fp16, K_fp16, V_fp16,
+            selected_blocks, topk_count,
+            O, rowmax_state, rowsum_state,
+            bs, q_len, kv_len, num_q_heads, num_kv_heads);
+    }
 }
 
 template<typename T, bool CAUSAL, int HEAD_DIM, int BLOCK_Q, int BLOCK_KV_FP4>
@@ -988,11 +1199,19 @@ static void dispatch_thrift_attention(
     int num_q_heads,
     int num_kv_heads)
 {
-    return launch_thrift_attention<T, CAUSAL, HEAD_DIM, 64, 64>(
-        Q_fp16, K_fp16, V_fp16, selected_blocks, topk_count,
-        topk_mask, topk_word_count, Q_fp4, K_fp4, V_fp4,
-        S_Q, S_K, S_V, O, rowmax_state, rowsum_state,
-        bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+    if constexpr (HEAD_DIM == 256) {
+        return launch_thrift_attention<T, CAUSAL, HEAD_DIM, 128, 128>(
+            Q_fp16, K_fp16, V_fp16, selected_blocks, topk_count,
+            topk_mask, topk_word_count, Q_fp4, K_fp4, V_fp4,
+            S_Q, S_K, S_V, O, rowmax_state, rowsum_state,
+            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+    } else {
+        return launch_thrift_attention<T, CAUSAL, HEAD_DIM, 64, 64>(
+            Q_fp16, K_fp16, V_fp16, selected_blocks, topk_count,
+            topk_mask, topk_word_count, Q_fp4, K_fp4, V_fp4,
+            S_Q, S_K, S_V, O, rowmax_state, rowsum_state,
+            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+    }
 }
 
 template<typename T, bool CAUSAL>
@@ -1046,8 +1265,16 @@ static void thrift_attention_nvfp4_typed(
             Q, K, V, S_Q, S_K, S_V, O,
             rowmax_state, rowsum_state,
             bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
-    else
+    else if (head_dim == 128)
         dispatch_thrift_attention<T, CAUSAL, 128>(
+            Q_fp16, K_fp16, V_fp16,
+            selected_blocks, topk_count,
+            topk_mask, topk_word_count,
+            Q, K, V, S_Q, S_K, S_V, O,
+            rowmax_state, rowsum_state,
+            bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+    else
+        dispatch_thrift_attention<T, CAUSAL, 256>(
             Q_fp16, K_fp16, V_fp16,
             selected_blocks, topk_count,
             topk_mask, topk_word_count,
