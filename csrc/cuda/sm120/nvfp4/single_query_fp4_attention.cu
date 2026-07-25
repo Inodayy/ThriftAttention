@@ -63,7 +63,7 @@ template <int HEIGHT, int WIDTH, int TB_SIZE, typename T>
 __device__
 void load_scales_sqfp4(uint32_t dst, const T *src, int src_stride, int tid) {
   constexpr int cp_size = WIDTH * sizeof(T);
-  static_assert(cp_size < 16);
+  static_assert(cp_size <= 16);
 
   auto load_row = [&](int row) {
     const uint32_t dst_addr = dst + row * WIDTH * sizeof(T);
@@ -706,6 +706,511 @@ void fp4_attention_single_query_kernel(
     }
 }
 
+// HEAD_DIM==256: single-buffered KV loop
+template<typename T, int BLOCK_KV, int HEAD_DIM, int HEAD_DIM_2, int SCALE_DIM>
+__launch_bounds__(WARP_SIZE_sqfp4)
+__global__
+void fp4_attention_single_query_hd256_kernel(
+    const __nv_fp4x2_e2m1* Q,
+    const __nv_fp4x2_e2m1* K,
+    const __nv_fp4x2_e2m1* V,
+    const __nv_fp8_e4m3* S_Q,
+    const __nv_fp8_e4m3* S_K,
+    const __nv_fp8_e4m3* S_V,
+    float* O_partial,       // [bs, num_kv_splits, 16, HEAD_DIM]
+    float* rowmax_partial,  // [bs, num_kv_splits, 16]
+    float* rowsum_partial,  // [bs, num_kv_splits, 16]
+    T* O_final,             // [bs, q_len, HEAD_DIM]
+    int* split_counter,     // [bs] — zeroed before launch
+    int bs,
+    int q_len,
+    int kv_len,
+    int kv_capacity,
+    int num_kv_splits,
+    int num_q_heads,
+    int num_kv_heads)
+{
+    using Traits = PrecisionTraits<T>;
+    constexpr int TB_SIZE = WARP_SIZE_sqfp4;
+    constexpr int BLOCK_Q = 16;
+    constexpr int MMA_M = 16;
+    constexpr int MMA_K = 64;
+    constexpr int MMA_N = 8;
+
+    const float softmax_scale = rsqrtf(static_cast<float>(HEAD_DIM));
+
+    // V/S_V are transposed; per-row stride uses capacity, not logical kv_len.
+    const int v_kv = cdiv_sqfp4(kv_capacity, 128) * 128;
+
+    const int split_id = blockIdx.x;
+    const int bid = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int lane_id = tid;
+    const int batch_id = bid / num_q_heads;
+    const int q_head = bid - batch_id * num_q_heads;
+    const int kv_head = q_head / (num_q_heads / num_kv_heads);
+    const int kv_bid = batch_id * num_kv_heads + kv_head;
+
+    // Compute KV range for this split
+    const int total_kv_blocks = cdiv_sqfp4(kv_len, BLOCK_KV);
+    const int kv_block_start = (split_id * total_kv_blocks) / num_kv_splits;
+    const int kv_block_end = ((split_id + 1) * total_kv_blocks) / num_kv_splits;
+
+    Q   += bid * q_len       * HEAD_DIM_2;
+    K   += kv_bid * kv_capacity * HEAD_DIM_2 + kv_block_start * BLOCK_KV * HEAD_DIM_2;
+    V   += kv_bid * HEAD_DIM    * (v_kv / 2) + kv_block_start * BLOCK_KV / 2;
+    S_Q += bid * q_len       * SCALE_DIM;
+    S_K += kv_bid * kv_capacity * SCALE_DIM  + kv_block_start * BLOCK_KV * SCALE_DIM;
+    S_V += kv_bid * v_kv        * SCALE_DIM  + kv_block_start * BLOCK_KV / 16;
+
+    const int partial_offset = bid * num_kv_splits + split_id;
+    O_partial      += partial_offset * BLOCK_Q * HEAD_DIM;
+    rowmax_partial += partial_offset * BLOCK_Q;
+    rowsum_partial += partial_offset * BLOCK_Q;
+
+    extern __shared__ uint8_t smem[];
+
+    // ---- Phase 1: load Q data + scales into smem → registers ----
+    const uint32_t Q_smem    = __cvta_generic_to_shared(smem);
+    const uint32_t Q_sf_smem = Q_smem + BLOCK_Q * HEAD_DIM_2 * sizeof(__nv_fp4x2_e2m1);
+
+    uint32_t Q_rmem[HEAD_DIM / MMA_K][4];
+    uint32_t sfQ_rmem[HEAD_DIM / MMA_K];
+
+    float rowmax[2];
+    float rowsum[2] = {};
+    float O_rmem[HEAD_DIM / MMA_N][4] = {};
+
+    rowmax[0] = -FLT_MAX;
+    rowmax[1] = -FLT_MAX;
+
+    // Zero Q data + Q scale smem, then load only q_len valid rows
+    {
+        constexpr int TOTAL_WORDS = (BLOCK_Q * HEAD_DIM_2 + BLOCK_Q * SCALE_DIM) / 4;
+        uint32_t* base = reinterpret_cast<uint32_t*>(smem);
+        for (int i = tid; i < TOTAL_WORDS; i += TB_SIZE)
+            base[i] = 0;
+    }
+    __syncwarp();
+    {
+        constexpr int LOAD_SIZE = 16;
+        const int total_loads = q_len * HEAD_DIM_2 / LOAD_SIZE;
+        for (int load_id = tid; load_id < total_loads; load_id += TB_SIZE) {
+            const int byte_offset = load_id * LOAD_SIZE;
+            const int row = byte_offset / HEAD_DIM_2;
+            const int col = byte_offset % HEAD_DIM_2;
+            uint32_t dst_addr = swizzle_sqfp4<HEAD_DIM_2>(Q_smem + row * HEAD_DIM_2 + col);
+            const auto *src_addr = Q + row * HEAD_DIM_2 + col;
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
+                :: "r"(dst_addr), "l"(src_addr));
+        }
+    }
+    {
+        constexpr int SF_ROW_BYTES = SCALE_DIM * (int)sizeof(__nv_fp8_e4m3);
+        for (int row = tid; row < q_len; row += TB_SIZE) {
+            const uint32_t dst_addr = Q_sf_smem + row * SF_ROW_BYTES;
+            const auto *src_addr = S_Q + row * SCALE_DIM;
+            asm volatile("cp.async.ca.shared.global [%0], [%1], %2;"
+                :: "r"(dst_addr), "l"(src_addr), "n"(SF_ROW_BYTES));
+        }
+    }
+    asm volatile("cp.async.commit_group;");
+    asm volatile("cp.async.wait_all;");
+    __syncwarp();
+
+    uint32_t Q_ld_base;
+    {
+        const int row_off = lane_id % 16;
+        const int col_off = (lane_id / 16) * 16;
+        Q_ld_base = swizzle_sqfp4<HEAD_DIM_2>(Q_smem + row_off * HEAD_DIM_2 + col_off);
+    }
+
+    for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_K; mma_id_d++) {
+        uint32_t addr = Q_ld_base;
+        addr ^= mma_id_d * (MMA_K / 2);
+        ldmatrix_x4_sqfp4(Q_rmem[mma_id_d], addr);
+    }
+
+    int sf_row_q = 0;
+    if (lane_id % 4 == 0) sf_row_q = (lane_id / 4);
+    else if (lane_id % 4 == 1) sf_row_q = (lane_id / 4) + 8;
+
+    for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_K; mma_id_d++) {
+        const uint32_t offset = (sf_row_q * SCALE_DIM + mma_id_d * 4) * (uint32_t)sizeof(__nv_fp8_e4m3);
+        asm volatile("ld.shared.u32 %0, [%1];"
+            : "=r"(sfQ_rmem[mma_id_d])
+            : "r"(Q_sf_smem + offset));
+    }
+
+    // ---- Phase 2: Single-buffered KV loop ----
+    __syncwarp();
+
+    const uint32_t smem_base = __cvta_generic_to_shared(smem);
+
+    // Smem layout: K | K scales | V | V scales (one KV tile)
+    const uint32_t K_smem_sq = smem_base;
+    const uint32_t cur_K_sf  = K_smem_sq + BLOCK_KV * HEAD_DIM_2 * (int)sizeof(__nv_fp4x2_e2m1);
+    const uint32_t cur_V     = cur_K_sf  + BLOCK_KV * SCALE_DIM  * (int)sizeof(__nv_fp8_e4m3);
+    const uint32_t cur_V_sf  = cur_V     + HEAD_DIM * (BLOCK_KV / 2) * (int)sizeof(__nv_fp4x2_e2m1);
+
+    uint32_t cur_K_ld;
+    {
+        const int row_off = lane_id % 8;
+        const int col_off = (lane_id / 8) * 16;
+        cur_K_ld = swizzle_sqfp4<HEAD_DIM_2>(K_smem_sq + row_off * HEAD_DIM_2 + col_off);
+    }
+
+    uint32_t K_rmem[BLOCK_KV / MMA_N][HEAD_DIM / MMA_K][2];
+    uint32_t V_rmem[BLOCK_KV / MMA_K][HEAD_DIM / MMA_N][2];
+    uint32_t sfK_rmem[BLOCK_KV / MMA_N][HEAD_DIM / MMA_K];
+    uint32_t sfV_rmem[BLOCK_KV / MMA_K][HEAD_DIM / MMA_N];
+
+    const int num_kv_iters = kv_block_end - kv_block_start;
+
+    // Helper: start async load of KV block at offset iter
+    auto start_kv_load = [&](int iter) {
+        const auto* Kp  = K   + iter * BLOCK_KV * HEAD_DIM_2;
+        const auto* Vp  = V   + iter * BLOCK_KV / 2;
+        const auto* SKp = S_K + iter * BLOCK_KV * SCALE_DIM;
+        const auto* SVp = S_V + iter * BLOCK_KV / 16;
+        gmem_to_smem_sqfp4<BLOCK_KV, HEAD_DIM_2, TB_SIZE, __nv_fp4x2_e2m1>(K_smem_sq, Kp, tid, HEAD_DIM_2);
+        load_scales_sqfp4<BLOCK_KV, SCALE_DIM, TB_SIZE, __nv_fp8_e4m3>(cur_K_sf, SKp, SCALE_DIM, tid);
+        gmem_to_smem_sqfp4<HEAD_DIM, BLOCK_KV / 2, TB_SIZE, __nv_fp4x2_e2m1>(cur_V, Vp, tid, v_kv / 2);
+        load_scales_sqfp4<HEAD_DIM, BLOCK_KV / 16, TB_SIZE, __nv_fp8_e4m3>(cur_V_sf, SVp, v_kv / 16, tid);
+        asm volatile("cp.async.commit_group;");
+    };
+
+    for (int kv_iter = 0; kv_iter < num_kv_iters; kv_iter++) {
+        float S_rmem[BLOCK_KV / MMA_N][4] = {};
+        uint32_t S_fp4_rmem[BLOCK_KV / MMA_K][4];
+        uint32_t S_fp4_s_rmem[BLOCK_KV / MMA_K];
+
+        // Load current block
+        start_kv_load(kv_iter);
+        asm volatile("cp.async.wait_all;");
+        __syncwarp();
+
+        // K → registers
+        if constexpr (HEAD_DIM / MMA_K == 2) {
+            for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
+                uint32_t addr = cur_K_ld + mma_id_kv * MMA_N * HEAD_DIM_2;
+                ldmatrix_x4_sqfp4(K_rmem[mma_id_kv][0], addr);
+            }
+        } else if constexpr (HEAD_DIM / MMA_K == 4) {
+            for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
+                uint32_t addr = cur_K_ld + mma_id_kv * MMA_N * HEAD_DIM_2;
+                ldmatrix_x4_sqfp4(K_rmem[mma_id_kv][0], addr);
+                ldmatrix_x4_sqfp4(K_rmem[mma_id_kv][2], addr ^ (2 * (MMA_K / 2)));
+            }
+        } else {
+            for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
+                for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_K; mma_id_d++) {
+                    uint32_t addr = cur_K_ld;
+                    addr += mma_id_kv * MMA_N * HEAD_DIM_2;
+                    addr ^= mma_id_d * (MMA_K / 2);
+                    ldmatrix_x2_sqfp4(K_rmem[mma_id_kv][mma_id_d], addr);
+                }
+        }
+
+        // K scales → registers
+        const int sf_row_k = lane_id / 4;
+        for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
+            for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_K; mma_id_d++) {
+                const int row = mma_id_kv * MMA_N + sf_row_k;
+                const uint32_t offset = (row * SCALE_DIM + mma_id_d * 4) * (uint32_t)sizeof(__nv_fp8_e4m3);
+                asm volatile("ld.shared.u32 %0, [%1];"
+                    : "=r"(sfK_rmem[mma_id_kv][mma_id_d])
+                    : "r"(cur_K_sf + offset));
+            }
+
+        // QK^T MMA
+        for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
+            for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_K; mma_id_d++)
+                mma_m16n8k64_nvfp4_sqfp4(
+                    Q_rmem[mma_id_d],
+                    K_rmem[mma_id_kv][mma_id_d],
+                    sfQ_rmem[mma_id_d],
+                    sfK_rmem[mma_id_kv][mma_id_d],
+                    S_rmem[mma_id_kv]);
+
+        // ---- online softmax (no causal mask) ----
+        for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
+            for (int reg_id = 0; reg_id < 4; reg_id++)
+                S_rmem[mma_id_kv][reg_id] *= softmax_scale;
+
+        float this_rowmax[2] = {-FLT_MAX, -FLT_MAX};
+        for (int blk = 0; blk < BLOCK_KV / MMA_N / 2; blk++) {
+            const int t0 = 2 * blk;
+            const int t1 = t0 + 1;
+            float gmax_upper = max(
+                max(S_rmem[t0][0], S_rmem[t0][1]),
+                max(S_rmem[t1][0], S_rmem[t1][1])
+            );
+            float gmax_lower = max(
+                max(S_rmem[t0][2], S_rmem[t0][3]),
+                max(S_rmem[t1][2], S_rmem[t1][3])
+            );
+            gmax_upper = max(gmax_upper, __shfl_xor_sync(0xFFFFFFFF, gmax_upper, 1));
+            gmax_upper = max(gmax_upper, __shfl_xor_sync(0xFFFFFFFF, gmax_upper, 2));
+            gmax_lower = max(gmax_lower, __shfl_xor_sync(0xFFFFFFFF, gmax_lower, 1));
+            gmax_lower = max(gmax_lower, __shfl_xor_sync(0xFFFFFFFF, gmax_lower, 2));
+            this_rowmax[0] = max(this_rowmax[0], gmax_upper);
+            this_rowmax[1] = max(this_rowmax[1], gmax_lower);
+        }
+
+        this_rowmax[0] = max(this_rowmax[0], rowmax[0]);
+        this_rowmax[1] = max(this_rowmax[1], rowmax[1]);
+
+        float rescale[2];
+        rescale[0] = __expf(rowmax[0] - this_rowmax[0]);
+        rescale[1] = __expf(rowmax[1] - this_rowmax[1]);
+        for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++) {
+            O_rmem[mma_id_d][0] *= rescale[0];
+            O_rmem[mma_id_d][1] *= rescale[0];
+            O_rmem[mma_id_d][2] *= rescale[1];
+            O_rmem[mma_id_d][3] *= rescale[1];
+        }
+
+        rowmax[0] = this_rowmax[0];
+        rowmax[1] = this_rowmax[1];
+
+        float this_rowsumexp[2] = {};
+        for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
+            float *regs = S_rmem[mma_id_kv];
+            regs[0] = __expf(regs[0] - rowmax[0]);
+            regs[1] = __expf(regs[1] - rowmax[0]);
+            regs[2] = __expf(regs[2] - rowmax[1]);
+            regs[3] = __expf(regs[3] - rowmax[1]);
+
+            this_rowsumexp[0] += regs[0] + regs[1];
+            this_rowsumexp[1] += regs[2] + regs[3];
+        }
+
+        this_rowsumexp[0] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[0], 1);
+        this_rowsumexp[0] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[0], 2);
+        this_rowsumexp[1] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[1], 1);
+        this_rowsumexp[1] += __shfl_xor_sync(0xFFFFFFFF, this_rowsumexp[1], 2);
+
+        rowsum[0] = rowsum[0] * rescale[0] + this_rowsumexp[0];
+        rowsum[1] = rowsum[1] * rescale[1] + this_rowsumexp[1];
+
+        constexpr float FP4_RANGE = 448.0f * 6.0f;
+        constexpr float FP4_MAX = 6.0f;
+
+        for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
+            S_rmem[mma_id_kv][0] *= FP4_RANGE;
+            S_rmem[mma_id_kv][1] *= FP4_RANGE;
+            S_rmem[mma_id_kv][2] *= FP4_RANGE;
+            S_rmem[mma_id_kv][3] *= FP4_RANGE;
+        }
+
+        float sf_P_upper[BLOCK_KV / MMA_N / 2];
+        float sf_P_lower[BLOCK_KV / MMA_N / 2];
+
+        for (int blk = 0; blk < BLOCK_KV / MMA_N / 2; blk++) {
+            int t0 = 2 * blk;
+            int t1 = t0 + 1;
+
+            float amax_upper = max(
+                max(S_rmem[t0][0], S_rmem[t0][1]),
+                max(S_rmem[t1][0], S_rmem[t1][1])
+            );
+            amax_upper = max(amax_upper, __shfl_xor_sync(0xFFFFFFFF, amax_upper, 1));
+            amax_upper = max(amax_upper, __shfl_xor_sync(0xFFFFFFFF, amax_upper, 2));
+
+            float amax_lower = max(
+                max(S_rmem[t0][2], S_rmem[t0][3]),
+                max(S_rmem[t1][2], S_rmem[t1][3])
+            );
+            amax_lower = max(amax_lower, __shfl_xor_sync(0xFFFFFFFF, amax_lower, 1));
+            amax_lower = max(amax_lower, __shfl_xor_sync(0xFFFFFFFF, amax_lower, 2));
+
+            sf_P_upper[blk] = amax_upper / FP4_MAX;
+            sf_P_lower[blk] = amax_lower / FP4_MAX;
+
+            float inv_upper = 1.0f / sf_P_upper[blk];
+            float inv_lower = 1.0f / sf_P_lower[blk];
+
+            S_rmem[t0][0] *= inv_upper;
+            S_rmem[t0][1] *= inv_upper;
+            S_rmem[t1][0] *= inv_upper;
+            S_rmem[t1][1] *= inv_upper;
+            S_rmem[t0][2] *= inv_lower;
+            S_rmem[t0][3] *= inv_lower;
+            S_rmem[t1][2] *= inv_lower;
+            S_rmem[t1][3] *= inv_lower;
+        }
+
+        // Reorder lanes so the following MMA consumes contiguous probability fragments.
+        const int qid = lane_id & 3;
+
+        for (int g = 0; g < BLOCK_KV / MMA_N / 4; g++) {
+            for (int r = 0; r < 4; r++) {
+                float send = (qid & 1) ? S_rmem[g*4 + 0][r] : S_rmem[g*4 + 1][r];
+                float recv = __shfl_xor_sync(0xFFFFFFFF, send, 1);
+                if (qid & 1) S_rmem[g*4 + 0][r] = recv;
+                else         S_rmem[g*4 + 1][r] = recv;
+
+                send = (qid & 1) ? S_rmem[g*4 + 2][r] : S_rmem[g*4 + 3][r];
+                recv = __shfl_xor_sync(0xFFFFFFFF, send, 1);
+                if (qid & 1) S_rmem[g*4 + 2][r] = recv;
+                else         S_rmem[g*4 + 3][r] = recv;
+
+                send = (qid & 2) ? S_rmem[g*4 + 0][r] : S_rmem[g*4 + 2][r];
+                recv = __shfl_xor_sync(0xFFFFFFFF, send, 2);
+                if (qid & 2) S_rmem[g*4 + 0][r] = recv;
+                else         S_rmem[g*4 + 2][r] = recv;
+
+                send = (qid & 2) ? S_rmem[g*4 + 1][r] : S_rmem[g*4 + 3][r];
+                recv = __shfl_xor_sync(0xFFFFFFFF, send, 2);
+                if (qid & 2) S_rmem[g*4 + 1][r] = recv;
+                else         S_rmem[g*4 + 3][r] = recv;
+            }
+        }
+
+        for (int g = 0; g < BLOCK_KV / MMA_N / 4; g++) {
+            float *r0 = S_rmem[g*4];
+            float *r1 = S_rmem[g*4 + 1];
+            float *r2 = S_rmem[g*4 + 2];
+            float *r3 = S_rmem[g*4 + 3];
+
+            S_fp4_rmem[0][2 * g] = cvt_8xf32_to_e2m1_packed_sqfp4(
+                r0[1], r0[0], r1[1], r1[0],
+                r2[1], r2[0], r3[1], r3[0]);
+
+            S_fp4_rmem[0][2 * g + 1] = cvt_8xf32_to_e2m1_packed_sqfp4(
+                r0[3], r0[2], r1[3], r1[2],
+                r2[3], r2[2], r3[3], r3[2]);
+        }
+
+        for (int mma_sc_id = 0; mma_sc_id < BLOCK_KV / MMA_K; mma_sc_id++) {
+            int base = mma_sc_id * 4;
+            uint32_t sfP_upper_packed = cvt_4xf32_to_e4m3_packed_sqfp4(
+                sf_P_upper[base + 1], sf_P_upper[base + 0],
+                sf_P_upper[base + 3], sf_P_upper[base + 2]);
+
+            uint32_t sfP_lower_packed = cvt_4xf32_to_e4m3_packed_sqfp4(
+                sf_P_lower[base + 1], sf_P_lower[base + 0],
+                sf_P_lower[base + 3], sf_P_lower[base + 2]);
+
+            S_fp4_s_rmem[mma_sc_id] =
+                (lane_id % 4 == 0) ? sfP_upper_packed : sfP_lower_packed;
+        }
+
+        // V → registers
+        for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_K; mma_id_kv++) {
+            for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d += 2) {
+                const int n_idx = mma_id_d * MMA_N + (lane_id / 16) * MMA_N + (lane_id % 8);
+                const int k_byte_offset = mma_id_kv * 32 + ((lane_id % 16) / 8) * 16;
+                uint32_t addr = swizzle_sqfp4<BLOCK_KV / 2>(
+                    cur_V + n_idx * (BLOCK_KV / 2) + k_byte_offset);
+
+                ldmatrix_x4_sqfp4(V_rmem[mma_id_kv][mma_id_d], addr);
+            }
+        }
+
+        // V scales → registers
+        constexpr int V_SF_STRIDE = BLOCK_KV / 16;
+        const int sf_col_v = lane_id / 4;
+        for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_K; mma_id_kv++)
+            for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++) {
+                const int hd_col = mma_id_d * MMA_N + sf_col_v;
+                const uint32_t offset = (hd_col * V_SF_STRIDE + mma_id_kv * 4) * (uint32_t)sizeof(__nv_fp8_e4m3);
+                asm volatile("ld.shared.u32 %0, [%1];"
+                    : "=r"(sfV_rmem[mma_id_kv][mma_id_d])
+                    : "r"(cur_V_sf + offset));
+            }
+
+        // O += P @ V
+        for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++)
+            for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_K; mma_id_kv++)
+                mma_m16n8k64_nvfp4_sqfp4(
+                    S_fp4_rmem[mma_id_kv],
+                    V_rmem[mma_id_kv][mma_id_d],
+                    S_fp4_s_rmem[mma_id_kv],
+                    sfV_rmem[mma_id_kv][mma_id_d],
+                    O_rmem[mma_id_d]);
+    }
+
+    // ---- Phase 3: Write partials — float2 vectorised stores ----
+    for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++) {
+        const int row = lane_id / 4;
+        const int col = mma_id_d * MMA_N + (lane_id % 4) * 2;
+        float *regs = O_rmem[mma_id_d];
+
+        *reinterpret_cast<float2*>(&O_partial[(row + 0) * HEAD_DIM + col]) =
+            make_float2(regs[0], regs[1]);
+        *reinterpret_cast<float2*>(&O_partial[(row + 8) * HEAD_DIM + col]) =
+            make_float2(regs[2], regs[3]);
+    }
+
+    if (lane_id % 4 == 0) {
+        const int row = lane_id / 4;
+        rowmax_partial[row + 0] = rowmax[0];
+        rowmax_partial[row + 8] = rowmax[1];
+        rowsum_partial[row + 0] = rowsum[0];
+        rowsum_partial[row + 8] = rowsum[1];
+    }
+
+    // ---- Fused reduction: last block to finish reduces all partials ----
+    __threadfence();
+
+    int completed = 0;
+    if (lane_id == 0)
+        completed = atomicAdd(&split_counter[bid], 1);
+    completed = __shfl_sync(0xFFFFFFFF, completed, 0);
+
+    if (completed != num_kv_splits - 1)
+        return;
+
+    // ---- Two-pass smem-assisted reduction ----
+    constexpr float FP4_RANGE_INV = 1.0f / (448.0f * 6.0f);
+    constexpr int ELEMS_PER_THREAD = (BLOCK_Q * HEAD_DIM) / TB_SIZE;
+
+    const float* batch_O = O_partial - split_id * BLOCK_Q * HEAD_DIM;
+    const float* batch_rowmax = rowmax_partial - split_id * BLOCK_Q;
+    const float* batch_rowsum = rowsum_partial - split_id * BLOCK_Q;
+
+    // Pass 1: 16 threads compute per-row rescale factors + norms → smem
+    float* rsc_smem  = reinterpret_cast<float*>(smem);
+    float* norm_smem = rsc_smem + num_kv_splits * BLOCK_Q;
+
+    if (lane_id < BLOCK_Q) {
+        const int row = lane_id;
+        float global_max = -FLT_MAX;
+        for (int s = 0; s < num_kv_splits; s++)
+            global_max = max(global_max, batch_rowmax[s * BLOCK_Q + row]);
+
+        float sum_acc = 0.0f;
+        for (int s = 0; s < num_kv_splits; s++) {
+            float rsc = __expf(batch_rowmax[s * BLOCK_Q + row] - global_max);
+            rsc_smem[s * BLOCK_Q + row] = rsc;
+            sum_acc += batch_rowsum[s * BLOCK_Q + row] * rsc;
+        }
+        norm_smem[row] = FP4_RANGE_INV / sum_acc;
+    }
+    __syncwarp();
+
+    // Pass 2: all 32 threads reduce O elements using precomputed factors
+    for (int elem = 0; elem < ELEMS_PER_THREAD; elem++) {
+        const int flat_idx = lane_id + elem * TB_SIZE;
+        const int row = flat_idx / HEAD_DIM;
+        const int col = flat_idx % HEAD_DIM;
+
+        float acc = 0.0f;
+        for (int s = 0; s < num_kv_splits; s++) {
+            float rsc = rsc_smem[s * BLOCK_Q + row];
+            acc += batch_O[s * BLOCK_Q * HEAD_DIM + row * HEAD_DIM + col] * rsc;
+        }
+
+        if (row < q_len) {
+            float norm = norm_smem[row];
+            O_final[bid * q_len * HEAD_DIM + row * HEAD_DIM + col] =
+                Traits::from_float(acc * norm);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Decode kernel: no-split fast path. One block per batch element, processes
 // all KV blocks, writes FP16 output directly. No workspace, no atomics.
@@ -865,7 +1370,7 @@ void fp4_attention_single_query_nosplit_kernel(
         asm volatile("cp.async.wait_all;");
         __syncwarp();
 
-        if constexpr (HEAD_DIM / MMA_K >= 2) {
+        if constexpr (HEAD_DIM / MMA_K == 2) {
             for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
                 uint32_t addr = K_ld_base + mma_id_kv * MMA_N * HEAD_DIM_2;
                 ldmatrix_x4_sqfp4(K_rmem[mma_id_kv][0], addr);
@@ -1285,7 +1790,7 @@ void fp4_attention_single_query_cta_kernel(
         __syncwarp();
 
         // K → registers
-        if constexpr (HEAD_DIM / MMA_K >= 2) {
+        if constexpr (HEAD_DIM / MMA_K == 2) {
             for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
                 uint32_t addr = K_ld_base + mma_id_kv * MMA_N * HEAD_DIM_2;
                 ldmatrix_x4_sqfp4(K_rmem[mma_id_kv][0], addr);
@@ -1711,18 +2216,28 @@ static void fp4_attention_single_query_split_launch(
                                 + BLOCK_KV * SCALE_DIM * sizeof(__nv_fp8_e4m3)
                                 + HEAD_DIM * (BLOCK_KV / 2) * sizeof(__nv_fp4x2_e2m1)
                                 + HEAD_DIM * (BLOCK_KV / 16) * sizeof(__nv_fp8_e4m3);
-    constexpr int kv_phase_smem = kv_phase_smem_single * 2;  // double-buffer
+    constexpr int kv_phase_smem = (HEAD_DIM == 256) ? kv_phase_smem_single
+                                                    : kv_phase_smem_single * 2;
     constexpr int smem_size = q_phase_smem > kv_phase_smem ? q_phase_smem : kv_phase_smem;
 
-    auto kernel = fp4_attention_single_query_kernel<T, BLOCK_KV, HEAD_DIM, HEAD_DIM_2, SCALE_DIM>;
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-
     dim3 grid(num_kv_splits, bs);
-    kernel<<<grid, TB_SIZE, smem_size>>>(
-        Q, K, V, S_Q, S_K, S_V,
-        O_partial, rowmax_partial, rowsum_partial,
-        O, split_counter,
-        bs, q_len, kv_len, kv_capacity, num_kv_splits, num_q_heads, num_kv_heads);
+    if constexpr (HEAD_DIM == 256) {
+        auto kernel = fp4_attention_single_query_hd256_kernel<T, BLOCK_KV, HEAD_DIM, HEAD_DIM_2, SCALE_DIM>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        kernel<<<grid, TB_SIZE, smem_size>>>(
+            Q, K, V, S_Q, S_K, S_V,
+            O_partial, rowmax_partial, rowsum_partial,
+            O, split_counter,
+            bs, q_len, kv_len, kv_capacity, num_kv_splits, num_q_heads, num_kv_heads);
+    } else {
+        auto kernel = fp4_attention_single_query_kernel<T, BLOCK_KV, HEAD_DIM, HEAD_DIM_2, SCALE_DIM>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        kernel<<<grid, TB_SIZE, smem_size>>>(
+            Q, K, V, S_Q, S_K, S_V,
+            O_partial, rowmax_partial, rowsum_partial,
+            O, split_counter,
+            bs, q_len, kv_len, kv_capacity, num_kv_splits, num_q_heads, num_kv_heads);
+    }
 }
 
 template<typename T>
@@ -1750,6 +2265,7 @@ static void fp4_attention_single_query_nvfp4_typed(
     auto S_K = reinterpret_cast<const __nv_fp8_e4m3*>(S_K_raw);
     auto S_V = reinterpret_cast<const __nv_fp8_e4m3*>(S_V_raw);
     auto O = reinterpret_cast<T*>(O_raw);
+    auto workspace = reinterpret_cast<float*>(workspace_raw);
 
     constexpr int BLOCK_KV = 64;
     const int total_kv_blocks = cdiv_sqfp4(kv_len, BLOCK_KV);
@@ -1757,13 +2273,19 @@ static void fp4_attention_single_query_nvfp4_typed(
     if (total_kv_blocks <= 4) {
         if (head_dim == 64)
             fp4_attention_single_query_nosplit_launch<T, 64>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
-        else
+        else if (head_dim == 128)
             fp4_attention_single_query_nosplit_launch<T, 128>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+        else
+            fp4_attention_single_query_nosplit_launch<T, 256>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+    } else if (head_dim == 256 && total_kv_blocks >= 128) {
+        fp4_attention_single_query_split_launch<T, 256>(Q, K, V, S_Q, S_K, S_V, O, workspace, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
     } else {
         if (head_dim == 64)
             fp4_attention_single_query_cta_launch<T, 64>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
-        else
+        else if (head_dim == 128)
             fp4_attention_single_query_cta_launch<T, 128>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
+        else
+            fp4_attention_single_query_cta_launch<T, 256>(Q, K, V, S_Q, S_K, S_V, O, bs, q_len, kv_len, kv_capacity, num_q_heads, num_kv_heads);
     }
 }
 
