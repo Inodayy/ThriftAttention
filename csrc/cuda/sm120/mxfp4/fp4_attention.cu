@@ -286,207 +286,6 @@ template<typename T, bool CAUSAL, int BLOCK_Q, int BLOCK_KV, int HEAD_DIM,
          int NUM_WARPS, int WARP_Q>
 __launch_bounds__(NUM_WARPS * TA_WARP_SIZE)
 __global__
-void fp4_attention_kernel(
-    const __nv_fp4x2_e2m1* Q,
-    const __nv_fp4x2_e2m1* K,
-    const __nv_fp4x2_e2m1* V,
-    const __nv_fp8_e8m0* S_Q,
-    const __nv_fp8_e8m0* S_K,
-    const __nv_fp8_e8m0* S_V,
-    T* O,
-    int bs,
-    int q_len,
-    int kv_len,
-    int kv_capacity,
-    int num_q_heads,
-    int num_kv_heads)
-{
-    using Traits = PrecisionTraits<T>;
-    constexpr int TB_SIZE = NUM_WARPS * TA_WARP_SIZE;
-    constexpr int MMA_M = 16;
-    constexpr int MMA_K = 64;
-    constexpr int MMA_N = 8;
-
-    const float softmax_scale = rsqrtf(static_cast<float>(HEAD_DIM));
-
-    const int bid = blockIdx.x;
-    const int tid = threadIdx.x;
-    const int warp_id = tid / TA_WARP_SIZE;
-    const int lane_id = tid % TA_WARP_SIZE;
-
-    const int num_q_blocks = ta_cdiv(q_len, BLOCK_Q);
-    const int q_bid = bid / num_q_blocks;
-    const int q_block_id = bid % num_q_blocks;
-    const int batch_id = q_bid / num_q_heads;
-    const int q_head = q_bid - batch_id * num_q_heads;
-    const int kv_head = q_head / (num_q_heads / num_kv_heads);
-    const int kv_bid = batch_id * num_kv_heads + kv_head;
-    const int v_kv = ta_cdiv(kv_capacity, 128) * 128;
-
-    Q += (q_bid * q_len + q_block_id * BLOCK_Q) * HEAD_DIM_2;
-    K += kv_bid * kv_capacity * HEAD_DIM_2;
-    V += kv_bid * HEAD_DIM * (v_kv / 2);
-
-    S_Q += (q_bid * q_len + q_block_id * BLOCK_Q) * SCALE_DIM;
-    S_K += kv_bid * kv_capacity * SCALE_DIM;
-    S_V += kv_bid * v_kv * SCALE_DIM;
-    O += (q_bid * q_len + q_block_id * BLOCK_Q) * HEAD_DIM;
-
-    extern __shared__ uint8_t smem[];
-    const uint32_t Q_smem = __cvta_generic_to_shared(smem);
-    const uint32_t Q_sf_smem = Q_smem + BLOCK_Q * HEAD_DIM_2 * sizeof(__nv_fp4x2_e2m1);
-    const uint32_t V_smem = Q_sf_smem + BLOCK_Q * SCALE_DIM * sizeof(__nv_fp8_e8m0);
-    const uint32_t V_sf_smem = V_smem + BLOCK_KV * HEAD_DIM_2 * sizeof(__nv_fp4x2_e2m1);
-
-    uint32_t Q_rmem[WARP_Q / MMA_M][HEAD_DIM / MMA_K][4];
-    uint32_t sfQ_rmem[WARP_Q / MMA_M][HEAD_DIM / MMA_K];
-
-    float rowmax[WARP_Q/MMA_M][2];
-    float rowsum[WARP_Q/MMA_M][2] = {};
-    float O_rmem[WARP_Q/MMA_M][HEAD_DIM/MMA_N][4] = {};
-
-    for (int mma_id_q = 0; mma_id_q < WARP_Q/MMA_M; mma_id_q++) {
-        rowmax[mma_id_q][0] = -FLT_MAX;
-        rowmax[mma_id_q][1] = -FLT_MAX;
-    }
-
-    // ---- load Q data global -> shared (swizzled) -> registers ----
-    ta_gmem_to_smem<BLOCK_Q, HEAD_DIM_2, TB_SIZE, __nv_fp4x2_e2m1>(Q_smem, Q, tid, HEAD_DIM_2);
-    asm volatile("cp.async.commit_group;");
-    asm volatile("cp.async.wait_all;");
-    __syncthreads();
-
-    // Pre-compute swizzled base address for Q ldmatrix.
-    // Row offsets that are multiples of 8 rows can be added (swizzle repeats every 8 rows).
-    // Column tile offsets use XOR: swizzle(base + col_delta) == swizzle(base) ^ col_delta.
-    uint32_t Q_ld_base;
-    {
-        const int row_off = warp_id * WARP_Q + (lane_id % 16);
-        const int col_off = (lane_id / 16) * 16;
-        Q_ld_base = ta_swizzle<HEAD_DIM_2>(Q_smem + row_off * HEAD_DIM_2 + col_off);
-    }
-
-    for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
-        for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_K; mma_id_d++) {
-            uint32_t addr = Q_ld_base;
-            addr += mma_id_q * MMA_M * HEAD_DIM_2;  // row: MMA_M=16, 16%8==0
-            addr ^= mma_id_d * (MMA_K / 2);          // col via XOR
-            ta_ldmatrix_x4(Q_rmem[mma_id_q][mma_id_d], addr);
-        }
-
-    // ---- load Q scales global -> shared -> registers ----
-    ta_load_scales<BLOCK_Q, SCALE_DIM, TB_SIZE, __nv_fp8_e8m0>(Q_sf_smem, S_Q, SCALE_DIM, tid);
-    asm volatile("cp.async.commit_group;");
-    asm volatile("cp.async.wait_all;");
-    __syncthreads();
-
-    int sf_row_q = 0;
-    if (lane_id % 4 == 0) sf_row_q = (lane_id / 4);
-    else if (lane_id % 4 == 1) sf_row_q = (lane_id / 4) + 8;
-
-    for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
-        for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_K; mma_id_d++) {
-            const int row = warp_id * WARP_Q + mma_id_q * MMA_M + sf_row_q;
-            const uint32_t offset = (row * SCALE_DIM + mma_id_d * 2) * (uint32_t)sizeof(__nv_fp8_e8m0);
-            sfQ_rmem[mma_id_q][mma_id_d] = ta_ld_shared_u16(Q_sf_smem + offset);
-        }
-    }
-
-    // ---- KV loop ----
-    __syncthreads();
-
-    const int total_kv_iters = ta_cdiv(kv_len, BLOCK_KV);
-    const int max_kv_pos = q_block_id * BLOCK_Q + BLOCK_Q - 1;
-    const int num_kv_iters = CAUSAL
-        ? min(max_kv_pos / BLOCK_KV + 1, total_kv_iters)
-        : total_kv_iters;
-
-    // Precompute per-thread query row offsets within the block.
-    const int q_block_start = q_block_id * BLOCK_Q;
-    const int q_row_upper = warp_id * WARP_Q + (lane_id / 4);
-    const int q_row_lower = q_row_upper + 8;
-    const int q_row_upper_global = q_block_start + q_row_upper;
-    const int q_row_lower_global = q_block_start + q_row_lower;
-    const int k_col_base = (lane_id % 4) * 2;
-
-    const uint32_t K_smem = __cvta_generic_to_shared(smem);
-    const uint32_t K_sf_smem = K_smem + BLOCK_KV * HEAD_DIM_2 * sizeof(__nv_fp4x2_e2m1);
-
-    // Pre-compute base address for K ldmatrix.
-    uint32_t K_ld_base;
-    {
-        const int row_off = lane_id % 8;
-        const int col_off = (lane_id / 8) * 16;
-        K_ld_base = ta_swizzle<HEAD_DIM_2>(K_smem + row_off * HEAD_DIM_2 + col_off);
-    }
-
-    for (int kv_iter = 0; kv_iter < num_kv_iters; kv_iter++) {
-        uint32_t S_fp4_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_K][4];
-        uint32_t S_fp4_s_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_K];
-
-        const int k_block_start = kv_iter * BLOCK_KV;
-        const bool needs_causal_mask = CAUSAL && ((k_block_start + BLOCK_KV - 1) > q_block_start);
-
-        // Load K first; issue V in a second async group so QK can overlap
-        // with the V transfer.
-        ta_gmem_to_smem<BLOCK_KV, HEAD_DIM_2, TB_SIZE, __nv_fp4x2_e2m1>(K_smem, K, tid, HEAD_DIM_2);
-        ta_load_scales<BLOCK_KV, SCALE_DIM, TB_SIZE, __nv_fp8_e8m0>(K_sf_smem, S_K, SCALE_DIM, tid);
-        asm volatile("cp.async.commit_group;");
-        ta_gmem_to_smem<HEAD_DIM, BLOCK_KV / 2, TB_SIZE, __nv_fp4x2_e2m1>(V_smem, V, tid, v_kv / 2);
-        ta_load_scales<HEAD_DIM, BLOCK_KV / 32, TB_SIZE, __nv_fp8_e8m0>(V_sf_smem, S_V, v_kv / 32, tid);
-        asm volatile("cp.async.commit_group;");
-        asm volatile("cp.async.wait_group 1;");
-        __syncthreads();
-
-        fp4_qk_softmax_pack<CAUSAL, BLOCK_KV, HEAD_DIM, HEAD_DIM_2, SCALE_DIM, WARP_Q>(
-            rowmax, rowsum, O_rmem, Q_rmem, sfQ_rmem, S_fp4_rmem, S_fp4_s_rmem,
-            K_ld_base, K_sf_smem, k_block_start, needs_causal_mask,
-            lane_id, k_col_base, q_row_upper_global, q_row_lower_global, softmax_scale);
-
-        // V layout in smem: [HEAD_DIM, BLOCK_KV/2], stride = BLOCK_KV/2 bytes.
-        // ldmatrix_x4: lanes 0-15 address tile mma_id_d, lanes 16-31 address tile mma_id_d+1.
-        asm volatile("cp.async.wait_group 0;");
-        __syncthreads();
-
-        fp4_pv<BLOCK_KV, HEAD_DIM, WARP_Q>(
-            O_rmem, S_fp4_rmem, S_fp4_s_rmem, V_smem, V_sf_smem, lane_id);
-
-        K += BLOCK_KV * HEAD_DIM_2;
-        S_K += BLOCK_KV * SCALE_DIM;
-        
-        V  += BLOCK_KV / 2;
-        S_V += BLOCK_KV / 32;
-    }
-
-    constexpr float FP4_RANGE_INV = 1.0f / 6.0f;
-
-    for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
-        for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++) {
-            const int row = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
-            const int col = mma_id_d * MMA_N + (lane_id % 4) * 2;
-
-            float *regs = O_rmem[mma_id_q][mma_id_d];
-
-            float norm0 = FP4_RANGE_INV / rowsum[mma_id_q][0];
-            float norm1 = FP4_RANGE_INV / rowsum[mma_id_q][1];
-
-            regs[0] *= norm0;
-            regs[1] *= norm0;
-            regs[2] *= norm1;
-            regs[3] *= norm1;
-
-            reinterpret_cast<typename Traits::vec2*>(O + (row + 0) * HEAD_DIM + col)[0] =
-                Traits::pack2(regs[0], regs[1]);
-            reinterpret_cast<typename Traits::vec2*>(O + (row + 8) * HEAD_DIM + col)[0] =
-                Traits::pack2(regs[2], regs[3]);
-        }
-}
-
-template<typename T, bool CAUSAL, int BLOCK_Q, int BLOCK_KV, int HEAD_DIM,
-         int HEAD_DIM_2, int SCALE_DIM,
-         int NUM_WARPS, int WARP_Q>
-__launch_bounds__(NUM_WARPS * TA_WARP_SIZE)
-__global__
 void fp4_attention_hd256_kernel(
     const __nv_fp4x2_e2m1* Q,
     const __nv_fp4x2_e2m1* K,
@@ -676,6 +475,207 @@ void fp4_attention_hd256_kernel(
             O_rmem, S_fp4_rmem, S_fp4_s_rmem, cur_V, cur_V_sf, lane_id);
 
         cur_buf_off = KV_BUF_BYTES - cur_buf_off;
+    }
+
+    constexpr float FP4_RANGE_INV = 1.0f / 6.0f;
+
+    for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
+        for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_N; mma_id_d++) {
+            const int row = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
+            const int col = mma_id_d * MMA_N + (lane_id % 4) * 2;
+
+            float *regs = O_rmem[mma_id_q][mma_id_d];
+
+            float norm0 = FP4_RANGE_INV / rowsum[mma_id_q][0];
+            float norm1 = FP4_RANGE_INV / rowsum[mma_id_q][1];
+
+            regs[0] *= norm0;
+            regs[1] *= norm0;
+            regs[2] *= norm1;
+            regs[3] *= norm1;
+
+            reinterpret_cast<typename Traits::vec2*>(O + (row + 0) * HEAD_DIM + col)[0] =
+                Traits::pack2(regs[0], regs[1]);
+            reinterpret_cast<typename Traits::vec2*>(O + (row + 8) * HEAD_DIM + col)[0] =
+                Traits::pack2(regs[2], regs[3]);
+        }
+}
+
+template<typename T, bool CAUSAL, int BLOCK_Q, int BLOCK_KV, int HEAD_DIM,
+         int HEAD_DIM_2, int SCALE_DIM,
+         int NUM_WARPS, int WARP_Q>
+__launch_bounds__(NUM_WARPS * TA_WARP_SIZE)
+__global__
+void fp4_attention_kernel(
+    const __nv_fp4x2_e2m1* Q,
+    const __nv_fp4x2_e2m1* K,
+    const __nv_fp4x2_e2m1* V,
+    const __nv_fp8_e8m0* S_Q,
+    const __nv_fp8_e8m0* S_K,
+    const __nv_fp8_e8m0* S_V,
+    T* O,
+    int bs,
+    int q_len,
+    int kv_len,
+    int kv_capacity,
+    int num_q_heads,
+    int num_kv_heads)
+{
+    using Traits = PrecisionTraits<T>;
+    constexpr int TB_SIZE = NUM_WARPS * TA_WARP_SIZE;
+    constexpr int MMA_M = 16;
+    constexpr int MMA_K = 64;
+    constexpr int MMA_N = 8;
+
+    const float softmax_scale = rsqrtf(static_cast<float>(HEAD_DIM));
+
+    const int bid = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int warp_id = tid / TA_WARP_SIZE;
+    const int lane_id = tid % TA_WARP_SIZE;
+
+    const int num_q_blocks = ta_cdiv(q_len, BLOCK_Q);
+    const int q_bid = bid / num_q_blocks;
+    const int q_block_id = bid % num_q_blocks;
+    const int batch_id = q_bid / num_q_heads;
+    const int q_head = q_bid - batch_id * num_q_heads;
+    const int kv_head = q_head / (num_q_heads / num_kv_heads);
+    const int kv_bid = batch_id * num_kv_heads + kv_head;
+    const int v_kv = ta_cdiv(kv_capacity, 128) * 128;
+
+    Q += (q_bid * q_len + q_block_id * BLOCK_Q) * HEAD_DIM_2;
+    K += kv_bid * kv_capacity * HEAD_DIM_2;
+    V += kv_bid * HEAD_DIM * (v_kv / 2);
+
+    S_Q += (q_bid * q_len + q_block_id * BLOCK_Q) * SCALE_DIM;
+    S_K += kv_bid * kv_capacity * SCALE_DIM;
+    S_V += kv_bid * v_kv * SCALE_DIM;
+    O += (q_bid * q_len + q_block_id * BLOCK_Q) * HEAD_DIM;
+
+    extern __shared__ uint8_t smem[];
+    const uint32_t Q_smem = __cvta_generic_to_shared(smem);
+    const uint32_t Q_sf_smem = Q_smem + BLOCK_Q * HEAD_DIM_2 * sizeof(__nv_fp4x2_e2m1);
+    const uint32_t V_smem = Q_sf_smem + BLOCK_Q * SCALE_DIM * sizeof(__nv_fp8_e8m0);
+    const uint32_t V_sf_smem = V_smem + BLOCK_KV * HEAD_DIM_2 * sizeof(__nv_fp4x2_e2m1);
+
+    uint32_t Q_rmem[WARP_Q / MMA_M][HEAD_DIM / MMA_K][4];
+    uint32_t sfQ_rmem[WARP_Q / MMA_M][HEAD_DIM / MMA_K];
+
+    float rowmax[WARP_Q/MMA_M][2];
+    float rowsum[WARP_Q/MMA_M][2] = {};
+    float O_rmem[WARP_Q/MMA_M][HEAD_DIM/MMA_N][4] = {};
+
+    for (int mma_id_q = 0; mma_id_q < WARP_Q/MMA_M; mma_id_q++) {
+        rowmax[mma_id_q][0] = -FLT_MAX;
+        rowmax[mma_id_q][1] = -FLT_MAX;
+    }
+
+    // ---- load Q data global -> shared (swizzled) -> registers ----
+    ta_gmem_to_smem<BLOCK_Q, HEAD_DIM_2, TB_SIZE, __nv_fp4x2_e2m1>(Q_smem, Q, tid, HEAD_DIM_2);
+    asm volatile("cp.async.commit_group;");
+    asm volatile("cp.async.wait_all;");
+    __syncthreads();
+
+    // Pre-compute swizzled base address for Q ldmatrix.
+    // Row offsets that are multiples of 8 rows can be added (swizzle repeats every 8 rows).
+    // Column tile offsets use XOR: swizzle(base + col_delta) == swizzle(base) ^ col_delta.
+    uint32_t Q_ld_base;
+    {
+        const int row_off = warp_id * WARP_Q + (lane_id % 16);
+        const int col_off = (lane_id / 16) * 16;
+        Q_ld_base = ta_swizzle<HEAD_DIM_2>(Q_smem + row_off * HEAD_DIM_2 + col_off);
+    }
+
+    for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
+        for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_K; mma_id_d++) {
+            uint32_t addr = Q_ld_base;
+            addr += mma_id_q * MMA_M * HEAD_DIM_2;  // row: MMA_M=16, 16%8==0
+            addr ^= mma_id_d * (MMA_K / 2);          // col via XOR
+            ta_ldmatrix_x4(Q_rmem[mma_id_q][mma_id_d], addr);
+        }
+
+    // ---- load Q scales global -> shared -> registers ----
+    ta_load_scales<BLOCK_Q, SCALE_DIM, TB_SIZE, __nv_fp8_e8m0>(Q_sf_smem, S_Q, SCALE_DIM, tid);
+    asm volatile("cp.async.commit_group;");
+    asm volatile("cp.async.wait_all;");
+    __syncthreads();
+
+    int sf_row_q = 0;
+    if (lane_id % 4 == 0) sf_row_q = (lane_id / 4);
+    else if (lane_id % 4 == 1) sf_row_q = (lane_id / 4) + 8;
+
+    for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
+        for (int mma_id_d = 0; mma_id_d < HEAD_DIM / MMA_K; mma_id_d++) {
+            const int row = warp_id * WARP_Q + mma_id_q * MMA_M + sf_row_q;
+            const uint32_t offset = (row * SCALE_DIM + mma_id_d * 2) * (uint32_t)sizeof(__nv_fp8_e8m0);
+            sfQ_rmem[mma_id_q][mma_id_d] = ta_ld_shared_u16(Q_sf_smem + offset);
+        }
+    }
+
+    // ---- KV loop ----
+    __syncthreads();
+
+    const int total_kv_iters = ta_cdiv(kv_len, BLOCK_KV);
+    const int max_kv_pos = q_block_id * BLOCK_Q + BLOCK_Q - 1;
+    const int num_kv_iters = CAUSAL
+        ? min(max_kv_pos / BLOCK_KV + 1, total_kv_iters)
+        : total_kv_iters;
+
+    // Precompute per-thread query row offsets within the block.
+    const int q_block_start = q_block_id * BLOCK_Q;
+    const int q_row_upper = warp_id * WARP_Q + (lane_id / 4);
+    const int q_row_lower = q_row_upper + 8;
+    const int q_row_upper_global = q_block_start + q_row_upper;
+    const int q_row_lower_global = q_block_start + q_row_lower;
+    const int k_col_base = (lane_id % 4) * 2;
+
+    const uint32_t K_smem = __cvta_generic_to_shared(smem);
+    const uint32_t K_sf_smem = K_smem + BLOCK_KV * HEAD_DIM_2 * sizeof(__nv_fp4x2_e2m1);
+
+    // Pre-compute base address for K ldmatrix.
+    uint32_t K_ld_base;
+    {
+        const int row_off = lane_id % 8;
+        const int col_off = (lane_id / 8) * 16;
+        K_ld_base = ta_swizzle<HEAD_DIM_2>(K_smem + row_off * HEAD_DIM_2 + col_off);
+    }
+
+    for (int kv_iter = 0; kv_iter < num_kv_iters; kv_iter++) {
+        uint32_t S_fp4_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_K][4];
+        uint32_t S_fp4_s_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_K];
+
+        const int k_block_start = kv_iter * BLOCK_KV;
+        const bool needs_causal_mask = CAUSAL && ((k_block_start + BLOCK_KV - 1) > q_block_start);
+
+        // Load K first; issue V in a second async group so QK can overlap
+        // with the V transfer.
+        ta_gmem_to_smem<BLOCK_KV, HEAD_DIM_2, TB_SIZE, __nv_fp4x2_e2m1>(K_smem, K, tid, HEAD_DIM_2);
+        ta_load_scales<BLOCK_KV, SCALE_DIM, TB_SIZE, __nv_fp8_e8m0>(K_sf_smem, S_K, SCALE_DIM, tid);
+        asm volatile("cp.async.commit_group;");
+        ta_gmem_to_smem<HEAD_DIM, BLOCK_KV / 2, TB_SIZE, __nv_fp4x2_e2m1>(V_smem, V, tid, v_kv / 2);
+        ta_load_scales<HEAD_DIM, BLOCK_KV / 32, TB_SIZE, __nv_fp8_e8m0>(V_sf_smem, S_V, v_kv / 32, tid);
+        asm volatile("cp.async.commit_group;");
+        asm volatile("cp.async.wait_group 1;");
+        __syncthreads();
+
+        fp4_qk_softmax_pack<CAUSAL, BLOCK_KV, HEAD_DIM, HEAD_DIM_2, SCALE_DIM, WARP_Q>(
+            rowmax, rowsum, O_rmem, Q_rmem, sfQ_rmem, S_fp4_rmem, S_fp4_s_rmem,
+            K_ld_base, K_sf_smem, k_block_start, needs_causal_mask,
+            lane_id, k_col_base, q_row_upper_global, q_row_lower_global, softmax_scale);
+
+        // V layout in smem: [HEAD_DIM, BLOCK_KV/2], stride = BLOCK_KV/2 bytes.
+        // ldmatrix_x4: lanes 0-15 address tile mma_id_d, lanes 16-31 address tile mma_id_d+1.
+        asm volatile("cp.async.wait_group 0;");
+        __syncthreads();
+
+        fp4_pv<BLOCK_KV, HEAD_DIM, WARP_Q>(
+            O_rmem, S_fp4_rmem, S_fp4_s_rmem, V_smem, V_sf_smem, lane_id);
+
+        K += BLOCK_KV * HEAD_DIM_2;
+        S_K += BLOCK_KV * SCALE_DIM;
+        
+        V  += BLOCK_KV / 2;
+        S_V += BLOCK_KV / 32;
     }
 
     constexpr float FP4_RANGE_INV = 1.0f / 6.0f;
