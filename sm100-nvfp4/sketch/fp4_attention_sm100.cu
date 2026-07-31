@@ -1301,8 +1301,7 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
 #else
                 reduce_blocks(scores, block_row_max);
                 float half_max = ta_fmax3(block_row_max[0], block_row_max[1], block_row_max[2]);
-                half_max = fmaxf(half_max, block_row_max[3]);
-                hmax1[row] = half_max;
+                hmax1[row] = fmaxf(half_max, block_row_max[3]);
 #endif
 
                 named_barrier_sync(bar_id, 2 * WARP_SIZE);  // max posted
