@@ -1172,6 +1172,12 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
                 // on the rare rescale branch (owner is at most one phase behind
                 // that commit, and P1Ready(g-1) already fired, so no deadlock).
                 // iter 0 needs no rescale: the first PV of a tile overwrites O.
+#if !FA4_ABLATE_CONVERT
+                convert_p(buf, 0, scores, block_row_max, row_tmem);
+                tcgen05_st_32x32bx1(sf_p_tmem(buf, 0) + row_tmem + warp_id, sf_word_of(block_row_max, m_used));
+#endif
+                FA4_PROF_TICK_SM2(PC_SM_STATS);
+
 #if FA4_ABLATE_RESCALE
                 (void)acc_scale;
 #else
@@ -1184,12 +1190,6 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
                     tcgen05_fence_after();
                     rescale_o(acc_scale);
                 }
-#endif
-                FA4_PROF_TICK_SM2(PC_SM_STATS);
-
-#if !FA4_ABLATE_CONVERT
-                convert_p(buf, 0, scores, block_row_max, row_tmem);
-                tcgen05_st_32x32bx1(sf_p_tmem(buf, 0) + row_tmem + warp_id, sf_word_of(block_row_max, m_used));
 #endif
                 tcgen05_wait_st();
                 tcgen05_fence_before();
