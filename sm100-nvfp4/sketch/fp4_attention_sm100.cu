@@ -39,8 +39,14 @@ constexpr int FA4_PV_N = 128;
 constexpr int FA4_QK_K_ITERS = FA4_HEAD_DIM / FA4_MMA_K;
 constexpr int FA4_PV_K_ITERS = FA4_KV_CHUNKS;
 constexpr int FA4_S_BUFS = 2;
-constexpr int FA4_NUM_SLOTS = 20;
-constexpr int FA4_NUM_KV_PAIRS = FA4_NUM_SLOTS / 2;
+// K and V get separate rings because their slots free at very different times:
+// a K slot is released right after qk_gemm, a V slot only after pv_gemm, which
+// waits on softmax.  One shared ring forced them to equal depth, and the load
+// warp then spent 67% of its time blocked on a free V slot versus 10% on K.
+constexpr int FA4_K_SLOTS = 4;
+constexpr int FA4_V_SLOTS = 16;
+constexpr int FA4_NUM_SLOTS = FA4_K_SLOTS + FA4_V_SLOTS;
+static_assert(FA4_K_SLOTS >= 2 && FA4_V_SLOTS >= 2, "ring too shallow");
 
 constexpr int SF_ATOM_BYTES = 512;
 constexpr int Q_DATA_BYTES = FA4_Q_STAGE_ROWS * (FA4_HEAD_DIM / 2);
@@ -243,6 +249,33 @@ __device__ __forceinline__
 int mbar_offset(MbarId id, int index = 0)
 {
     return (static_cast<int>(id) + index) * 8;
+}
+
+// Ring position and mbarrier parity for global KV iteration g. Unsigned
+// because signed % and / need sign-correcting sequences that cost registers.
+__device__ __forceinline__
+int k_slot_of(int g)
+{
+    return static_cast<int>(static_cast<unsigned>(g) % unsigned(FA4_K_SLOTS));
+}
+
+__device__ __forceinline__
+int v_slot_of(int g)
+{
+    return FA4_K_SLOTS
+         + static_cast<int>(static_cast<unsigned>(g) % unsigned(FA4_V_SLOTS));
+}
+
+__device__ __forceinline__
+int k_phase_of(int g)
+{
+    return static_cast<int>((static_cast<unsigned>(g) / unsigned(FA4_K_SLOTS)) & 1u);
+}
+
+__device__ __forceinline__
+int v_phase_of(int g)
+{
+    return static_cast<int>((static_cast<unsigned>(g) / unsigned(FA4_V_SLOTS)) & 1u);
 }
 
 __device__ __forceinline__
@@ -941,8 +974,7 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
         FA4_PROF_TICK(PC_LD_ISSUE_Q);
     };
 
-    auto issue_k = [&](int slot, int g, int kv_iter) {
-        const int full_phase = (g / FA4_NUM_KV_PAIRS) & 1;
+    auto issue_k = [&](int slot, int full_phase, int kv_iter) {
         mbarrier_wait(mbar_base + mbar_offset(MbarId::KVEmpty, slot), full_phase ^ 1);
         FA4_PROF_TICK(PC_LD_WAIT_KEMPTY);
 
@@ -960,8 +992,7 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
         FA4_PROF_TICK(PC_LD_ISSUE_K);
     };
 
-    auto issue_v = [&](int slot, int g, int kv_iter) {
-        const int full_phase = (g / FA4_NUM_KV_PAIRS) & 1;
+    auto issue_v = [&](int slot, int full_phase, int kv_iter) {
         mbarrier_wait(mbar_base + mbar_offset(MbarId::KVEmpty, slot), full_phase ^ 1);
         FA4_PROF_TICK(PC_LD_WAIT_VEMPTY);
 
@@ -1270,7 +1301,8 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
 #else
                 reduce_blocks(scores, block_row_max);
                 float half_max = ta_fmax3(block_row_max[0], block_row_max[1], block_row_max[2]);
-                hmax1[row] = fmaxf(half_max, block_row_max[3]);
+                half_max = fmaxf(half_max, block_row_max[3]);
+                hmax1[row] = half_max;
 #endif
 
                 named_barrier_sync(bar_id, 2 * WARP_SIZE);  // max posted
@@ -1324,11 +1356,17 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
             mbarrier_wait(mbar_base + mbar_offset(MbarId::QEmpty), (lt & 1) ^ 1);
             FA4_PROF_TICK(PC_LD_WAIT_QEMPTY);
             issue_q();
+            // K(g+1) always goes before V(g): issue_v blocks on a free V slot,
+            // and the mma warp needs K(g+1) before it needs V(g).
+            if (kv_iters > 0) {
+                issue_k(k_slot_of(gi), k_phase_of(gi), 0);
+            }
             for (int iter = 0; iter < kv_iters; iter++) {
                 const int g = gi + iter;
-                const int k_slot = 2 * (g % FA4_NUM_KV_PAIRS);
-                issue_k(k_slot, g, iter);
-                issue_v(k_slot + 1, g, iter);
+                if (iter + 1 < kv_iters) {
+                    issue_k(k_slot_of(g + 1), k_phase_of(g + 1), iter + 1);
+                }
+                issue_v(v_slot_of(g), v_phase_of(g), iter);
             }
             gi += kv_iters;
         }
@@ -1356,8 +1394,8 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
                 {
                     const int g = gi;
                     const int buf = g & 1;
-                    const int k_slot = 2 * (g % FA4_NUM_KV_PAIRS);
-                    const int k_phase = (g / FA4_NUM_KV_PAIRS) & 1;
+                    const int k_slot = k_slot_of(g);
+                    const int k_phase = k_phase_of(g);
                     mbarrier_wait(mbar_base + mbar_offset(MbarId::KVFull, k_slot), k_phase);
                     FA4_PROF_TICK(PC_MMA_WAIT_K);
                     tcgen05_fence_after();
@@ -1376,8 +1414,8 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
                     const int g = gi + iter;
                     const int buf = g & 1;
                     const int ph = (g >> 1) & 1;
-                    const int v_slot = 2 * (g % FA4_NUM_KV_PAIRS) + 1;
-                    const int v_phase = (g / FA4_NUM_KV_PAIRS) & 1;
+                    const int v_slot = v_slot_of(g);
+                    const int v_phase = v_phase_of(g);
                     const int vbuf = g & 1;
 
                     // Prefetch the next tile's QK first so SFull(g+1) fires
@@ -1385,8 +1423,8 @@ void nvfp4_sm100_attention_kernel(const __grid_constant__ CUtensorMap q_tmap,
                     if (iter + 1 < kv_iters) {
                         const int ng = g + 1;
                         const int nbuf = ng & 1;
-                        const int nk_slot = 2 * (ng % FA4_NUM_KV_PAIRS);
-                        const int nk_phase = (ng / FA4_NUM_KV_PAIRS) & 1;
+                        const int nk_slot = k_slot_of(ng);
+                        const int nk_phase = k_phase_of(ng);
 
                         mbarrier_wait(mbar_base + mbar_offset(MbarId::KVFull, nk_slot), nk_phase);
                         FA4_PROF_TICK(PC_MMA_WAIT_K);
